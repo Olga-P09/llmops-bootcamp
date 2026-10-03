@@ -32,7 +32,9 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // TODO(student, W4)
 
     // routing (W2): поки одна модель
-    var model = defaultModel; // TODO(student, W2)
+
+
+  var model = Route(body.Message, defaultModel); // TODO(student, W2)
 
     // W1: беремо активний prompt із registry
     string promptVersion;
@@ -175,6 +177,25 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     });
 });
 
+// W2: routing policy
+// fallback chain: mock-strong -> mock-mini -> controlled error
+static string Route(string message, string defaultModel)
+{
+    // Routing rules below are only for mock mode.
+    // For a real configured model, keep the selected model unchanged.
+    if (defaultModel != "mock")
+        return defaultModel;
+
+    var text = message.ToLowerInvariant();
+
+    bool escalation =
+        text.Contains("поверн") ||
+        text.Contains("терміново") ||
+        text.Contains("скарг") ||
+        text.Contains("refund");
+
+    return escalation ? "mock-strong" : "mock-mini";
+}
 
 // ======================================================
 // Prompt Registry
