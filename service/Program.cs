@@ -1,6 +1,7 @@
 // Сервіс — це наш control plane. LiteLLM тільки ходить у модель, а рішення
 // (яку модель брати, коли ретраїти, скільки коштує) робимо тут.
-// MODEL=mock — дефолт, грошей не треба. MODEL=gpt-5-mini або claude-haiku + ключ у gateway/.env — реальна модель.
+// MODEL=mock — дефолт, грошей не треба.
+// MODEL=gpt-5-mini або claude-haiku + ключ у gateway/.env — реальна модель.
 
 using System.Text;
 using System.Text.Json;
@@ -8,13 +9,19 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHttpClient();
+
 var app = builder.Build();
 
 // налаштування беремо з оточення (задаються в docker-compose.yml)
-var gateway = Environment.GetEnvironmentVariable("GATEWAY_URL") ?? "http://gateway:4000";
+var gateway = Environment.GetEnvironmentVariable("GATEWAY_URL")
+    ?? "http://gateway:4000";
+
 var dbConn = Environment.GetEnvironmentVariable("DB_CONN")
     ?? "Host=postgres;Database=llmops;Username=llmops;Password=llmops";
-var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
+
+var defaultModel = Environment.GetEnvironmentVariable("MODEL")
+    ?? "mock";
+
 
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
@@ -24,105 +31,391 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
-    // routing (W2): поки одна модель, а треба обирати за задачею
-    var model = defaultModel;  // TODO(student, W2)
+    // routing (W2): поки одна модель
+    var model = defaultModel; // TODO(student, W2)
 
-    // промпт (W1): захардкодив — має братися з реєстру (таблиця prompts) з версією
-    var systemPrompt = "You are a support assistant.";  // TODO(student, W1)
+    // W1: беремо активний prompt із registry
+    string promptVersion;
+    string systemPrompt;
 
-    // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
+    try
+    {
+        (promptVersion, systemPrompt) = await GetActivePrompt(dbConn);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Failed to load active prompt: {ex.Message}");
+
+        return Results.Json(
+            new
+            {
+                request_id = requestId,
+                content = "Сервіс тимчасово недоступний.",
+                tool = (string?)null,
+                latency_ms = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds
+            },
+            statusCode: 503
+        );
+    }
+
+    // cache (W3): перед викликом глянути в Redis
     // TODO(student, W3)
 
-    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
+    // fallback (W4): якщо 429/5xx — піти на іншого провайдера
     // TODO(student, W4)
+
     var payload = JsonSerializer.Serialize(new
     {
         model,
         messages = new object[]
         {
-            new { role = "system", content = systemPrompt },
-            new { role = "user", content = body.Message }
+            new
+            {
+                role = "system",
+                content = systemPrompt
+            },
+            new
+            {
+                role = "user",
+                content = body.Message
+            }
         }
     });
 
     var http = httpFactory.CreateClient();
+
     var answer = "";
     string? toolCall = null;
-    int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
+
+    int promptTokens = 0;
+    int completionTokens = 0;
+    int status = 0; // 0 = відповіді не було
+
     try
     {
         var response = await http.PostAsync(
             $"{gateway}/v1/chat/completions",
-            new StringContent(payload, Encoding.UTF8, "application/json"));
+            new StringContent(
+                payload,
+                Encoding.UTF8,
+                "application/json"
+            )
+        );
+
         status = (int)response.StatusCode;
+
         var rawJson = await response.Content.ReadAsStringAsync();
 
         using var doc = JsonDocument.Parse(rawJson);
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        answer = message.GetProperty("content").GetString() ?? "";
 
-        // tools + HITL (W3/W4): якщо модель попросила інструмент — виконати;
-        // перед незворотною дією (створити тікет) спитати людину. поки лише читаємо назву.
+        var message = doc.RootElement
+            .GetProperty("choices")[0]
+            .GetProperty("message");
+
+        answer = message
+            .GetProperty("content")
+            .GetString() ?? "";
+
+        // tools + HITL (W3/W4)
         // TODO(student, W3/W4)
-        if (message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        if (
+            message.TryGetProperty("tool_calls", out var tools)
+            && tools.ValueKind == JsonValueKind.Array
+            && tools.GetArrayLength() > 0
+        )
         {
-            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
+            toolCall = tools[0]
+                .GetProperty("function")
+                .GetProperty("name")
+                .GetString();
         }
 
         var usage = doc.RootElement.GetProperty("usage");
-        promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
-        completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+
+        promptTokens = usage
+            .GetProperty("prompt_tokens")
+            .GetInt32();
+
+        completionTokens = usage
+            .GetProperty("completion_tokens")
+            .GetInt32();
     }
     catch
     {
-        // мережа/gateway недоступні або відповідь не розпарсилась (status лишиться 0/5xx).
-        // TODO(student, W4): тут краще graceful degradation
+        // мережа/gateway недоступні або відповідь не розпарсилась
+        // TODO(student, W4): graceful degradation
         answer = "Сервіс тимчасово недоступний.";
     }
 
-    var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+    var latencyMs =
+        (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
-    // cost (W2): порахувати tokens * ціна і покласти в cost_usd
-    decimal? costUsd = null;  // TODO(student, W2)
+    // cost (W2)
+    decimal? costUsd = null; // TODO(student, W2)
 
-    // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, latencyMs, promptTokens, completionTokens, costUsd, status);
+    // W1: записуємо prompt_version у unified log
+    await LogRequest(
+        dbConn,
+        requestId,
+        model,
+        promptVersion,
+        latencyMs,
+        promptTokens,
+        completionTokens,
+        costUsd,
+        status
+    );
 
-    return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
+    return Results.Json(new
+    {
+        request_id = requestId,
+        content = answer,
+        tool = toolCall,
+        latency_ms = latencyMs
+    });
 });
 
-// ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
-app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
-app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
-app.MapGet("/prompts", () => Results.Json(new { todo = "list from prompts table" }));              // W1/W2: [ { name, version, active } ]
-app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
+
+// ======================================================
+// Prompt Registry
+// ======================================================
+
+// W1: отримати активний prompt
+static async Task<(string Version, string Body)> GetActivePrompt(
+    string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+
+    await using var cmd = new NpgsqlCommand(
+        """
+        SELECT version, body
+        FROM prompts
+        WHERE name = 'support-system'
+          AND active = true
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        db
+    );
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+
+    if (await reader.ReadAsync())
+    {
+        return (
+            reader.GetString(0),
+            reader.GetString(1)
+        );
+    }
+
+    // fail-visible:
+    // активного prompt немає.
+    // fallback навмисно НЕ містить слово "support",
+    // тому mock змінить поведінку.
+    return (
+        "none",
+        "You are an assistant."
+    );
+}
+
+
+// GET /prompts
+// Повертає всі версії, щоб UI показував registry
+app.MapGet("/prompts", async () =>
+{
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+
+    await using var cmd = new NpgsqlCommand(
+        """
+        SELECT name, version, active
+        FROM prompts
+        ORDER BY created_at ASC
+        """,
+        db
+    );
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+
+    var prompts = new List<object>();
+
+    while (await reader.ReadAsync())
+    {
+        prompts.Add(new
+        {
+            name = reader.GetString(0),
+            version = reader.GetString(1),
+            active = reader.GetBoolean(2)
+        });
+    }
+
+    return Results.Json(prompts);
+});
+
+
+// POST /prompts/{version}/activate
+// Атомарно робить вказану версію активною,
+// а всі інші версії support-system — неактивними.
+app.MapPost("/prompts/{version}/activate", async (string version) =>
+{
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+
+    await using var cmd = new NpgsqlCommand(
+        """
+        UPDATE prompts
+        SET active = (version = @v)
+        WHERE name = 'support-system'
+          AND EXISTS (
+              SELECT 1
+              FROM prompts
+              WHERE name = 'support-system'
+                AND version = @v
+          )
+        """,
+        db
+    );
+
+    cmd.Parameters.AddWithValue("v", version);
+
+    var affected = await cmd.ExecuteNonQueryAsync();
+
+    // Якщо версії не існує — UPDATE не змінить жодного рядка
+    if (affected == 0)
+    {
+        return Results.NotFound(new
+        {
+            error = $"Prompt version '{version}' not found."
+        });
+    }
+
+    return Results.Ok(new
+    {
+        version,
+        active = true
+    });
+});
+
+
+// ======================================================
+// Інші endpoints
+// ======================================================
+
+app.MapGet(
+    "/health",
+    () => Results.Ok(new { status = "ok" })
+);
+
+app.MapGet(
+    "/observability",
+    () => Results.Json(
+        new { todo = "aggregate from requests table" }
+    )
+); // W5
+
+app.MapGet(
+    "/cost",
+    () => Results.Json(
+        new { todo = "sum cost_usd for today + budget" }
+    )
+); // W2/W5
+
+app.MapGet(
+    "/providers",
+    () => Results.Json(
+        new { todo = "provider health" }
+    )
+); // W5
+
+app.MapGet(
+    "/approvals",
+    () => Results.Json(
+        new { todo = "pending HITL approvals" }
+    )
+); // W4
+
 
 app.Run("http://0.0.0.0:8080");
 
-// пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
-static async Task LogRequest(string conn, Guid id, string model, int latency,
-    int promptTokens, int completionTokens, decimal? cost, int status)
+
+// ======================================================
+// Unified Log
+// ======================================================
+
+// пише один рядок у requests.
+// якщо лог впав — запит користувача все одно віддаємо.
+static async Task LogRequest(
+    string conn,
+    Guid id,
+    string model,
+    string promptVersion,
+    int latency,
+    int promptTokens,
+    int completionTokens,
+    decimal? cost,
+    int status)
 {
     try
     {
         await using var db = new NpgsqlConnection(conn);
         await db.OpenAsync();
+
         await using var cmd = new NpgsqlCommand(
-            "INSERT INTO requests (request_id, model, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
-            + "VALUES (@id, @model, @lat, @pt, @ct, @cost, @status)", db);
+            """
+            INSERT INTO requests
+            (
+                request_id,
+                model,
+                prompt_version,
+                latency_ms,
+                prompt_tokens,
+                completion_tokens,
+                cost_usd,
+                status
+            )
+            VALUES
+            (
+                @id,
+                @model,
+                @promptVersion,
+                @lat,
+                @pt,
+                @ct,
+                @cost,
+                @status
+            )
+            """,
+            db
+        );
+
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
+        cmd.Parameters.AddWithValue(
+            "promptVersion",
+            promptVersion
+        );
         cmd.Parameters.AddWithValue("lat", latency);
         cmd.Parameters.AddWithValue("pt", promptTokens);
         cmd.Parameters.AddWithValue("ct", completionTokens);
-        cmd.Parameters.AddWithValue("cost", (object?)cost ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("status", status.ToString());
+        cmd.Parameters.AddWithValue(
+            "cost",
+            (object?)cost ?? DBNull.Value
+        );
+        cmd.Parameters.AddWithValue(
+            "status",
+            status.ToString()
+        );
+
         await cmd.ExecuteNonQueryAsync();
     }
-    catch { /* не валимо запит через лог */ }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine(
+            $"Failed to write request log: {ex.Message}"
+        );
+    }
 }
+
 
 record ChatIn(string Message);
