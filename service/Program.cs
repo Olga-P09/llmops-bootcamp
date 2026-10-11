@@ -19,9 +19,14 @@ var gateway = Environment.GetEnvironmentVariable("GATEWAY_URL")
 var dbConn = Environment.GetEnvironmentVariable("DB_CONN")
     ?? "Host=postgres;Database=llmops;Username=llmops;Password=llmops";
 
-var defaultModel = Environment.GetEnvironmentVariable("MODEL")
-    ?? "mock";
+var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
 
+// [W2] training prices in USD per 1k tokens
+var prices = new Dictionary<string, (decimal InPer1K, decimal OutPer1K)>
+{
+    ["mock-mini"]   = (0.00015m, 0.0006m),
+    ["mock-strong"] = (0.0025m,  0.01m),
+};
 
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
@@ -32,7 +37,9 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // TODO(student, W4)
 
     // routing (W2): поки одна модель
-    var model = defaultModel; // TODO(student, W2)
+
+
+  var model = Route(body.Message, defaultModel); // TODO(student, W2)
 
     // W1: беремо активний prompt із registry
     string promptVersion;
@@ -149,10 +156,18 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     var latencyMs =
         (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+          
+// cost (W2): usage -> model price -> cost_usd
+decimal? costUsd = null;
 
-    // cost (W2)
-    decimal? costUsd = null; // TODO(student, W2)
-
+if (prices.TryGetValue(model, out var price))
+{
+    costUsd = Math.Round(
+        promptTokens / 1000m * price.InPer1K
+        + completionTokens / 1000m * price.OutPer1K,
+        6
+    );
+}
     // W1: записуємо prompt_version у unified log
     await LogRequest(
         dbConn,
@@ -175,6 +190,26 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     });
 });
 
+// W2: routing policy
+// fallback chain: mock-strong -> mock-mini -> controlled error
+// budget policy: at 80% of daily budget, raise an alert and keep routing unchanged
+static string Route(string message, string defaultModel)
+{
+    // Routing rules below are only for mock mode.
+    // For a real configured model, keep the selected model unchanged.
+    if (defaultModel != "mock")
+        return defaultModel;
+
+    var text = message.ToLowerInvariant();
+
+    bool escalation =
+        text.Contains("поверн") ||
+        text.Contains("терміново") ||
+        text.Contains("скарг") ||
+        text.Contains("refund");
+
+    return escalation ? "mock-strong" : "mock-mini";
+}
 
 // ======================================================
 // Prompt Registry
@@ -314,12 +349,29 @@ app.MapGet(
     )
 ); // W5
 
-app.MapGet(
-    "/cost",
-    () => Results.Json(
-        new { todo = "sum cost_usd for today + budget" }
-    )
-); // W2/W5
+app.MapGet("/cost", async () =>
+{
+    await using var conn = new NpgsqlConnection(dbConn);
+    await conn.OpenAsync();
+
+    await using var cmd = new NpgsqlCommand(
+        """
+        SELECT COALESCE(SUM(cost_usd), 0)
+        FROM requests
+        WHERE created_at::date = CURRENT_DATE
+        """,
+        conn
+    );
+
+    var result = await cmd.ExecuteScalarAsync();
+    var today = Convert.ToDecimal(result);
+
+    return Results.Json(new
+    {
+        today_usd = Math.Round(today, 4),
+        budget_usd = 5.0
+    });
+});// W2/W5
 
 app.MapGet(
     "/providers",
