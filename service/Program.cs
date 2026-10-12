@@ -36,10 +36,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
-    // routing (W2): поки одна модель
-
-
-  var model = Route(body.Message, defaultModel); // TODO(student, W2)
+    // routing (W2): скарги / повернення / терміново → mock-strong, решта → mock-mini (див. Route)
+    var model = Route(body.Message, defaultModel);
 
     // W1: беремо активний prompt із registry
     string promptVersion;
@@ -65,7 +63,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         );
     }
 
-    // cache (W3): перед викликом глянути в Redis
+    // cache (W3): перед викликом глянути в in-memory exact cache — раптом вже відповідали.
+    // ключ = model + повний текст systemPrompt + body.Message (зміна будь-чого з трьох → інший ключ).
     // TODO(student, W3)
 
     // fallback (W4): якщо 429/5xx — піти на іншого провайдера
@@ -156,18 +155,19 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     var latencyMs =
         (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
-          
-// cost (W2): usage -> model price -> cost_usd
-decimal? costUsd = null;
 
-if (prices.TryGetValue(model, out var price))
-{
-    costUsd = Math.Round(
-        promptTokens / 1000m * price.InPer1K
-        + completionTokens / 1000m * price.OutPer1K,
-        6
-    );
-}
+    // cost (W2): usage -> model price -> cost_usd
+    decimal? costUsd = null;
+
+    if (prices.TryGetValue(model, out var price))
+    {
+        costUsd = Math.Round(
+            promptTokens / 1000m * price.InPer1K
+            + completionTokens / 1000m * price.OutPer1K,
+            6
+        );
+    }
+
     // W1: записуємо prompt_version у unified log
     await LogRequest(
         dbConn,
@@ -190,9 +190,9 @@ if (prices.TryGetValue(model, out var price))
     });
 });
 
-// W2: routing policy
-// fallback chain: mock-strong -> mock-mini -> controlled error
-// budget policy: at 80% of daily budget, raise an alert and keep routing unchanged
+// W2: routing policy — обрати модель за текстом запиту (лише в mock-режимі).
+// TODO(student, W4): fallback chain mock-strong -> mock-mini -> controlled error. НЕ реалізовано.
+// TODO(student, W5): budget alert при 80% денного бюджету (routing не змінюємо). НЕ реалізовано.
 static string Route(string message, string defaultModel)
 {
     // Routing rules below are only for mock mode.
@@ -257,7 +257,7 @@ static async Task<(string Version, string Body)> GetActivePrompt(
 
 // GET /prompts
 // Повертає всі версії, щоб UI показував registry
-app.MapGet("/prompts", async () =>
+app.MapGet("/prompts", () => WithDb("list prompts", async () =>
 {
     await using var db = new NpgsqlConnection(dbConn);
     await db.OpenAsync();
@@ -286,13 +286,13 @@ app.MapGet("/prompts", async () =>
     }
 
     return Results.Json(prompts);
-});
+}));
 
 
 // POST /prompts/{version}/activate
 // Атомарно робить вказану версію активною,
 // а всі інші версії support-system — неактивними.
-app.MapPost("/prompts/{version}/activate", async (string version) =>
+app.MapPost("/prompts/{version}/activate", (string version) => WithDb("activate prompt", async () =>
 {
     await using var db = new NpgsqlConnection(dbConn);
     await db.OpenAsync();
@@ -330,26 +330,32 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
         version,
         active = true
     });
-});
+}));
 
 
 // ======================================================
 // Інші endpoints
 // ======================================================
 
+// ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
+
+// ліфнес, не для консолі
 app.MapGet(
     "/health",
     () => Results.Ok(new { status = "ok" })
 );
 
+// W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
 app.MapGet(
     "/observability",
     () => Results.Json(
         new { todo = "aggregate from requests table" }
     )
-); // W5
+);
 
-app.MapGet("/cost", async () =>
+// W2/W5: { today_usd, budget_usd }
+// якщо БД недоступна — 503, а НЕ today_usd = 0: невідома витрата ≠ нульова.
+app.MapGet("/cost", () => WithDb("read today's cost", async () =>
 {
     await using var conn = new NpgsqlConnection(dbConn);
     await conn.OpenAsync();
@@ -371,24 +377,52 @@ app.MapGet("/cost", async () =>
         today_usd = Math.Round(today, 4),
         budget_usd = 5.0
     });
-});// W2/W5
+}));
 
+// W5: { providers: [ { name, status } ] }
 app.MapGet(
     "/providers",
     () => Results.Json(
         new { todo = "provider health" }
     )
-); // W5
+);
 
+// W4: { pending: [ { id, action } ] }
 app.MapGet(
     "/approvals",
     () => Results.Json(
         new { todo = "pending HITL approvals" }
     )
-); // W4
+);
 
 
 app.Run("http://0.0.0.0:8080");
+
+
+// ======================================================
+// DB errors -> 503
+// ======================================================
+
+// postgres недоступний (не підключились / таймаут / помилка БД) → 503 з JSON,
+// а не голий 500. як і в /chat: лог у stderr, клієнту — зрозуміла відповідь.
+static async Task<IResult> WithDb(string operation, Func<Task<IResult>> action)
+{
+    try
+    {
+        return await action();
+    }
+    catch (Exception ex) when (ex is NpgsqlException
+        or System.Net.Sockets.SocketException
+        or TimeoutException)
+    {
+        Console.Error.WriteLine($"Database unavailable ({operation}): {ex.Message}");
+
+        return Results.Json(
+            new { error = "Database unavailable. Please try again later." },
+            statusCode: 503
+        );
+    }
+}
 
 
 // ======================================================
