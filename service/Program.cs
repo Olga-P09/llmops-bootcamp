@@ -154,8 +154,9 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             .GetProperty("content")
             .GetString() ?? "";
 
-        // tools + HITL (W3/W4)
-        // TODO(student, W3/W4)
+        // tools (W3): lookup_order виконуємо і підклеюємо результат до відповіді.
+        // HITL (W4): create_ticket — незворотна дія, тут НЕ виконується (черга approvals).
+        // TODO(student, W4)
         if (
             message.TryGetProperty("tool_calls", out var tools)
             && tools.ValueKind == JsonValueKind.Array
@@ -166,6 +167,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
                 .GetProperty("function")
                 .GetProperty("name")
                 .GetString();
+
+            if (toolCall == "lookup_order")
+            {
+                answer += $" (статус: {RunTool(toolCall)})";
+            }
         }
 
         var usage = doc.RootElement.GetProperty("usage");
@@ -253,6 +259,14 @@ static string Route(string message, string defaultModel)
 
     return escalation ? "mock-strong" : "mock-mini";
 }
+
+// W3: виконати інструмент, який попросила модель. результат — mock, без реальної системи замовлень.
+// викликається лише для lookup_order (read-only); create_ticket сюди не потрапляє (W4, HITL).
+static string RunTool(string name) => name switch
+{
+    "lookup_order" => "в дорозі",
+    _ => throw new ArgumentException($"Unknown tool: {name}", nameof(name))
+};
 
 // ======================================================
 // Prompt Registry
