@@ -3,6 +3,7 @@
 // MODEL=mock — дефолт, грошей не треба.
 // MODEL=gpt-5-mini або claude-haiku + ключ у gateway/.env — реальна модель.
 
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Npgsql;
@@ -27,6 +28,12 @@ var prices = new Dictionary<string, (decimal InPer1K, decimal OutPer1K)>
     ["mock-mini"]   = (0.00015m, 0.0006m),
     ["mock-strong"] = (0.0025m,  0.01m),
 };
+
+// [W3] in-memory exact cache: ключ → готова відповідь моделі.
+// живе в пам'яті процесу й обнуляється при рестарті сервісу (TTL поки немає).
+var cache = new ConcurrentDictionary<string, string>();
+long cacheHits = 0;
+long cacheMisses = 0;  // знадобляться для плитки cache-hit % (W5)
 
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
@@ -65,7 +72,31 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     // cache (W3): перед викликом глянути в in-memory exact cache — раптом вже відповідали.
     // ключ = model + повний текст systemPrompt + body.Message (зміна будь-чого з трьох → інший ключ).
-    // TODO(student, W3)
+    // \u001F — роздільник, якого немає у звичайному тексті: "ab"+"c" і "a"+"bc" дають різні ключі.
+    var cacheKey = string.Join('\u001F', model, systemPrompt, body.Message);
+
+    if (cache.TryGetValue(cacheKey, out var cachedAnswer))
+    {
+        Interlocked.Increment(ref cacheHits);
+
+        var hitLatencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+        Console.WriteLine($"CACHE HIT  model={model} prompt={promptVersion} request={requestId}");
+
+        // модель не викликали: 0 токенів і cost 0 (не null) — так у логах видно, що це кеш
+        await LogRequest(dbConn, requestId, model, promptVersion, hitLatencyMs, 0, 0, 0m, 200);
+
+        return Results.Json(new
+        {
+            request_id = requestId,
+            content = cachedAnswer,
+            tool = (string?)null,
+            latency_ms = hitLatencyMs,
+            cached = true
+        });
+    }
+
+    Interlocked.Increment(ref cacheMisses);
+    Console.WriteLine($"CACHE MISS model={model} prompt={promptVersion} request={requestId}");
 
     // fallback (W4): якщо 429/5xx — піти на іншого провайдера
     // TODO(student, W4)
@@ -96,6 +127,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     int promptTokens = 0;
     int completionTokens = 0;
     int status = 0; // 0 = відповіді не було
+    bool modelOk = false; // true лише якщо відповідь моделі повністю розібрана
 
     try
     {
@@ -145,12 +177,22 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         completionTokens = usage
             .GetProperty("completion_tokens")
             .GetInt32();
+
+        modelOk = true;
     }
     catch
     {
         // мережа/gateway недоступні або відповідь не розпарсилась
         // TODO(student, W4): graceful degradation
         answer = "Сервіс тимчасово недоступний.";
+    }
+
+    // cache (W3): кладемо лише успішну відповідь без tool_call.
+    // помилку не кешуємо — інакше один збій «застрягне» для цього питання до рестарту;
+    // tool_call не кешуємо — дію/дані інструмента треба отримувати щоразу заново.
+    if (modelOk && status == 200 && toolCall is null)
+    {
+        cache[cacheKey] = answer;
     }
 
     var latencyMs =
@@ -186,7 +228,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         request_id = requestId,
         content = answer,
         tool = toolCall,
-        latency_ms = latencyMs
+        latency_ms = latencyMs,
+        cached = false
     });
 });
 
