@@ -205,9 +205,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
     // cost (W2): usage -> model price -> cost_usd
+    // модель не відповіла (збій) → cost лишається null: невідома вартість ≠ 0.
+    // 0 у логах — лише для cache hit, тож збій не виглядає як влучання в кеш.
     decimal? costUsd = null;
 
-    if (prices.TryGetValue(model, out var price))
+    if (modelOk && prices.TryGetValue(model, out var price))
     {
         costUsd = Math.Round(
             promptTokens / 1000m * price.InPer1K
