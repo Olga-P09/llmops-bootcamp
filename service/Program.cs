@@ -35,6 +35,14 @@ var cache = new ConcurrentDictionary<string, string>();
 long cacheHits = 0;
 long cacheMisses = 0;  // знадобляться для плитки cache-hit % (W5)
 
+// [W4] кожен перехід між моделями у fallback-ланцюгу — з нього живе плитка «Fallback» (W5)
+long fallbackEvents = 0;
+
+// [W4] graceful degradation: усі моделі ланцюга впали. чесно, без вигаданих фактів
+// (ні статусу, ні номера, ні «зроблено») і не стартерний текст.
+const string DegradedAnswer =
+    "Вибачте, зараз у нас тимчасова проблема з відповідями. Спробуйте, будь ласка, трохи пізніше.";
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
@@ -71,11 +79,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     // cache (W3): перед викликом глянути в in-memory exact cache — раптом вже відповідали.
-    // ключ = model + повний текст systemPrompt + body.Message (зміна будь-чого з трьох → інший ключ).
-    // \u001F — роздільник, якого немає у звичайному тексті: "ab"+"c" і "a"+"bc" дають різні ключі.
-    var cacheKey = string.Join('\u001F', model, systemPrompt, body.Message);
-
-    if (cache.TryGetValue(cacheKey, out var cachedAnswer))
+    if (cache.TryGetValue(CacheKey(model, systemPrompt, body.Message), out var cachedAnswer))
     {
         Interlocked.Increment(ref cacheHits);
 
@@ -98,107 +102,140 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     Interlocked.Increment(ref cacheMisses);
     Console.WriteLine($"CACHE MISS model={model} prompt={promptVersion} request={requestId}");
 
-    // fallback (W4): якщо 429/5xx — піти на іншого провайдера
-    // TODO(student, W4)
-
-    var payload = JsonSerializer.Serialize(new
-    {
-        model,
-        messages = new object[]
-        {
-            new
-            {
-                role = "system",
-                content = systemPrompt
-            },
-            new
-            {
-                role = "user",
-                content = body.Message
-            }
-        }
-    });
+    // fallback (W4): ідемо по ланцюгу моделей (див. FallbackChain).
+    // 429 / 5xx / мережа / нерозбірна відповідь → наступна модель; кожен перехід → fallbackEvents.
+    // усі впали → graceful degradation (DegradedAnswer, HTTP 200, не 500).
+    var chain = FallbackChain(model, defaultModel);
 
     var http = httpFactory.CreateClient();
 
     var answer = "";
     string? toolCall = null;
+    var respondedModel = model; // модель, що реально відповіла (при повному збої — остання спробувана)
 
     int promptTokens = 0;
     int completionTokens = 0;
     int status = 0; // 0 = відповіді не було
     bool modelOk = false; // true лише якщо відповідь моделі повністю розібрана
 
-    try
+    for (var attempt = 0; attempt < chain.Length && !modelOk; attempt++)
     {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(
-                payload,
-                Encoding.UTF8,
-                "application/json"
-            )
-        );
-
-        status = (int)response.StatusCode;
-
-        var rawJson = await response.Content.ReadAsStringAsync();
-
-        using var doc = JsonDocument.Parse(rawJson);
-
-        var message = doc.RootElement
-            .GetProperty("choices")[0]
-            .GetProperty("message");
-
-        answer = message
-            .GetProperty("content")
-            .GetString() ?? "";
-
-        // tools (W3): lookup_order виконуємо і підклеюємо результат до відповіді.
-        // HITL (W4): create_ticket — незворотна дія, тут НЕ виконується (черга approvals).
-        // TODO(student, W4)
-        if (
-            message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array
-            && tools.GetArrayLength() > 0
-        )
+        if (attempt > 0)
         {
-            toolCall = tools[0]
-                .GetProperty("function")
-                .GetProperty("name")
-                .GetString();
-
-            if (toolCall == "lookup_order")
-            {
-                answer += $" (статус: {RunTool(toolCall)})";
-            }
+            Interlocked.Increment(ref fallbackEvents);
+            Console.WriteLine($"FALLBACK {chain[attempt - 1]} -> {chain[attempt]} (status={status}) request={requestId}");
         }
 
-        var usage = doc.RootElement.GetProperty("usage");
+        respondedModel = chain[attempt];
+        answer = "";
+        toolCall = null;
+        promptTokens = 0;
+        completionTokens = 0;
+        status = 0;
 
-        promptTokens = usage
-            .GetProperty("prompt_tokens")
-            .GetInt32();
+        var payload = JsonSerializer.Serialize(new
+        {
+            model = respondedModel,
+            messages = new object[]
+            {
+                new
+                {
+                    role = "system",
+                    content = systemPrompt
+                },
+                new
+                {
+                    role = "user",
+                    content = body.Message
+                }
+            }
+        });
 
-        completionTokens = usage
-            .GetProperty("completion_tokens")
-            .GetInt32();
+        try
+        {
+            var response = await http.PostAsync(
+                $"{gateway}/v1/chat/completions",
+                new StringContent(
+                    payload,
+                    Encoding.UTF8,
+                    "application/json"
+                )
+            );
 
-        modelOk = true;
+            status = (int)response.StatusCode;
+
+            // 429 / 5xx (і будь-який не-2xx) — збій провайдера: пробуємо наступну модель
+            if (!response.IsSuccessStatusCode)
+            {
+                continue;
+            }
+
+            var rawJson = await response.Content.ReadAsStringAsync();
+
+            using var doc = JsonDocument.Parse(rawJson);
+
+            var message = doc.RootElement
+                .GetProperty("choices")[0]
+                .GetProperty("message");
+
+            answer = message
+                .GetProperty("content")
+                .GetString() ?? "";
+
+            // tools (W3): lookup_order виконуємо і підклеюємо результат до відповіді.
+            // HITL (W4): create_ticket — незворотна дія, тут НЕ виконується (черга approvals).
+            // TODO(student, W4)
+            if (
+                message.TryGetProperty("tool_calls", out var tools)
+                && tools.ValueKind == JsonValueKind.Array
+                && tools.GetArrayLength() > 0
+            )
+            {
+                toolCall = tools[0]
+                    .GetProperty("function")
+                    .GetProperty("name")
+                    .GetString();
+
+                if (toolCall == "lookup_order")
+                {
+                    answer += $" (статус: {RunTool(toolCall)})";
+                }
+            }
+
+            var usage = doc.RootElement.GetProperty("usage");
+
+            promptTokens = usage
+                .GetProperty("prompt_tokens")
+                .GetInt32();
+
+            completionTokens = usage
+                .GetProperty("completion_tokens")
+                .GetInt32();
+
+            modelOk = true;
+        }
+        catch (Exception ex)
+        {
+            // мережа/gateway недоступні або відповідь не розпарсилась — теж збій: наступна модель
+            Console.Error.WriteLine($"Model {respondedModel} failed: {ex.Message}");
+        }
     }
-    catch
+
+    if (!modelOk)
     {
-        // мережа/gateway недоступні або відповідь не розпарсилась
-        // TODO(student, W4): graceful degradation
-        answer = "Сервіс тимчасово недоступний.";
+        // graceful degradation (W4): усі моделі ланцюга впали
+        Console.Error.WriteLine($"DEGRADED all models failed ({string.Join(" -> ", chain)}) request={requestId}");
+        answer = DegradedAnswer;
+        toolCall = null;
     }
 
     // cache (W3): кладемо лише успішну відповідь без tool_call.
     // помилку не кешуємо — інакше один збій «застрягне» для цього питання до рестарту;
     // tool_call не кешуємо — дію/дані інструмента треба отримувати щоразу заново.
+    // ключ — від моделі, що реально відповіла: відповідь резервної моделі не видаємо за відповідь основної.
     if (modelOk && status == 200 && toolCall is null)
     {
-        cache[cacheKey] = answer;
+        cache[CacheKey(respondedModel, systemPrompt, body.Message)] = answer;
     }
 
     var latencyMs =
@@ -209,7 +246,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // 0 у логах — лише для cache hit, тож збій не виглядає як влучання в кеш.
     decimal? costUsd = null;
 
-    if (modelOk && prices.TryGetValue(model, out var price))
+    if (modelOk && prices.TryGetValue(respondedModel, out var price))
     {
         costUsd = Math.Round(
             promptTokens / 1000m * price.InPer1K
@@ -219,10 +256,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     // W1: записуємо prompt_version у unified log
+    // W4: model = та, що реально відповіла (після fallback), а не та, яку обрав routing
     await LogRequest(
         dbConn,
         requestId,
-        model,
+        respondedModel,
         promptVersion,
         latencyMs,
         promptTokens,
@@ -242,7 +280,6 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 });
 
 // W2: routing policy — обрати модель за текстом запиту (лише в mock-режимі).
-// TODO(student, W4): fallback chain mock-strong -> mock-mini -> controlled error. НЕ реалізовано.
 // TODO(student, W5): budget alert при 80% денного бюджету (routing не змінюємо). НЕ реалізовано.
 static string Route(string message, string defaultModel)
 {
@@ -261,6 +298,24 @@ static string Route(string message, string defaultModel)
 
     return escalation ? "mock-strong" : "mock-mini";
 }
+
+// W4: fallback-ланцюг — спершу модель від routing, далі резервний аліас із litellm-config.yaml
+// (mock-strong ↔ mock-mini); після останнього — graceful degradation.
+// реальна модель (MODEL=...): резервної моделі в конфігу не задано, тож лише вона сама.
+static string[] FallbackChain(string routed, string defaultModel)
+{
+    if (defaultModel != "mock")
+        return new[] { routed };
+
+    return routed == "mock-strong"
+        ? new[] { "mock-strong", "mock-mini" }
+        : new[] { "mock-mini", "mock-strong" };
+}
+
+// W3: ключ кешу = model + повний текст systemPrompt + повідомлення (зміна будь-чого → інший ключ).
+// \u001F — роздільник, якого немає у звичайному тексті: "ab"+"c" і "a"+"bc" дають різні ключі.
+static string CacheKey(string model, string systemPrompt, string message) =>
+    string.Join('\u001F', model, systemPrompt, message);
 
 // W3: виконати інструмент, який попросила модель. результат — mock, без реальної системи замовлень.
 // викликається лише для lookup_order (read-only); create_ticket сюди не потрапляє (W4, HITL).
