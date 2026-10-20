@@ -242,7 +242,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         var approvalId = requestId.ToString();
         approvals[approvalId] = new Approval(approvalId, "create_ticket", userMessage, "pending", null, DateTimeOffset.UtcNow);
         Console.WriteLine($"APPROVAL pending id={approvalId} action=create_ticket");
-        answer += " Заявку передано оператору на підтвердження.";
+        // текст моделі («Створюю тікет…») замінюємо: до approve дію не виконано, і відповідь не має це приховувати
+        answer = "Заявку на створення тікета передано оператору на підтвердження. Тікет ще не створено — його створять після підтвердження.";
     }
 
     // cache (W3): кладемо лише успішну відповідь без tool_call.
