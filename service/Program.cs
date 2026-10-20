@@ -43,16 +43,23 @@ long fallbackEvents = 0;
 const string DegradedAnswer =
     "Вибачте, зараз у нас тимчасова проблема з відповідями. Спробуйте, будь ласка, трохи пізніше.";
 
+// [W4] HITL: черга заявок на незворотні дії (create_ticket). id заявки = request_id запиту чату.
+// стан заявки: pending → executing → done; перехід pending → executing атомарний (див. approve).
+var approvals = new ConcurrentDictionary<string, Approval>();
+long ticketSeq = 1000; // mock-нумерація тікетів: TICKET-1001, TICKET-1002, ...
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // guardrails (W4): PII маскуємо на вході сервісу — ДО routing, ключа кешу, виклику моделі й черги approvals.
+    // далі в /chat використовується лише userMessage; сирий body.Message нікуди не йде.
+    // (вхідний детект prompt injection — опційна частина hw4, не реалізовано)
+    var userMessage = MaskPii(body.Message);
 
     // routing (W2): скарги / повернення / терміново → mock-strong, решта → mock-mini (див. Route)
-    var model = Route(body.Message, defaultModel);
+    var model = Route(userMessage, defaultModel);
 
     // W1: беремо активний prompt із registry
     string promptVersion;
@@ -79,7 +86,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     // cache (W3): перед викликом глянути в in-memory exact cache — раптом вже відповідали.
-    if (cache.TryGetValue(CacheKey(model, systemPrompt, body.Message), out var cachedAnswer))
+    if (cache.TryGetValue(CacheKey(model, systemPrompt, userMessage), out var cachedAnswer))
     {
         Interlocked.Increment(ref cacheHits);
 
@@ -146,7 +153,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
                 new
                 {
                     role = "user",
-                    content = body.Message
+                    content = userMessage
                 }
             }
         });
@@ -183,8 +190,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
                 .GetString() ?? "";
 
             // tools (W3): lookup_order виконуємо і підклеюємо результат до відповіді.
-            // HITL (W4): create_ticket — незворотна дія, тут НЕ виконується (черга approvals).
-            // TODO(student, W4)
+            // HITL (W4): create_ticket — незворотна дія, тут НЕ виконується: після циклу стає в чергу approvals.
             if (
                 message.TryGetProperty("tool_calls", out var tools)
                 && tools.ValueKind == JsonValueKind.Array
@@ -229,13 +235,23 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         toolCall = null;
     }
 
+    // HITL (W4): create_ticket не виконуємо — лише ставимо заявку в чергу (єдина точка HITL-гейту).
+    // тікет створить тільки POST /approvals/{id}/approve; до того ні номера, ні «зроблено» у відповіді.
+    if (modelOk && toolCall == "create_ticket")
+    {
+        var approvalId = requestId.ToString();
+        approvals[approvalId] = new Approval(approvalId, "create_ticket", userMessage, "pending", null, DateTimeOffset.UtcNow);
+        Console.WriteLine($"APPROVAL pending id={approvalId} action=create_ticket");
+        answer += " Заявку передано оператору на підтвердження.";
+    }
+
     // cache (W3): кладемо лише успішну відповідь без tool_call.
     // помилку не кешуємо — інакше один збій «застрягне» для цього питання до рестарту;
     // tool_call не кешуємо — дію/дані інструмента треба отримувати щоразу заново.
     // ключ — від моделі, що реально відповіла: відповідь резервної моделі не видаємо за відповідь основної.
     if (modelOk && status == 200 && toolCall is null)
     {
-        cache[CacheKey(respondedModel, systemPrompt, body.Message)] = answer;
+        cache[CacheKey(respondedModel, systemPrompt, userMessage)] = answer;
     }
 
     var latencyMs =
@@ -324,6 +340,11 @@ static string RunTool(string name) => name switch
     "lookup_order" => "в дорозі",
     _ => throw new ArgumentException($"Unknown tool: {name}", nameof(name))
 };
+
+// W4: guardrail PII — email → [email] (regex з GETTING_STARTED §10).
+// викликається на вході /chat, до routing, ключа кешу, виклику моделі й черги approvals.
+static string MaskPii(string s) =>
+    System.Text.RegularExpressions.Regex.Replace(s, @"[\w.\-]+@[\w.\-]+", "[email]");
 
 // ======================================================
 // Prompt Registry
@@ -501,13 +522,44 @@ app.MapGet(
     )
 );
 
-// W4: { pending: [ { id, action } ] }
-app.MapGet(
-    "/approvals",
-    () => Results.Json(
-        new { todo = "pending HITL approvals" }
-    )
-);
+// W4: { pending: [ { id, action } ] } + done: виконані заявки з result (номер тікета) —
+// спостережуваний слід «рівно один тікет» після approve.
+app.MapGet("/approvals", () =>
+{
+    var all = approvals.Values.OrderBy(a => a.CreatedAt).ToList();
+
+    return Results.Json(new
+    {
+        pending = all
+            .Where(a => a.Status == "pending")
+            .Select(a => new { id = a.Id, action = a.Action, message = a.Message, created_at = a.CreatedAt }),
+        done = all
+            .Where(a => a.Status == "done")
+            .Select(a => new { id = a.Id, action = a.Action, message = a.Message, result = a.Result, created_at = a.CreatedAt })
+    });
+});
+
+// W4: виконати незворотну дію після підтвердження людиною.
+// атомарний check-then-act: перехід pending → executing через TryUpdate (compare-and-swap).
+// з паралельних approve одного id перехід виграє лише один — він і створює тікет;
+// решта, як і повтор після виконання, отримують 404: заявку вже спожито
+// («вже виконано» і «не існувало» навмисно нерозрізненні — відповідь не підказує, які id існують).
+app.MapPost("/approvals/{id}/approve", (string id) =>
+{
+    if (!approvals.TryGetValue(id, out var current)
+        || current.Status != "pending"
+        || !approvals.TryUpdate(id, current with { Status = "executing" }, current))
+    {
+        return Results.NotFound(new { error = $"Approval '{id}' not found or already done." });
+    }
+
+    // mock-дія: «створюємо» тікет (у реальній системі — виклик тікет-системи з ключем ідемпотентності = id)
+    var ticket = $"TICKET-{Interlocked.Increment(ref ticketSeq)}";
+    approvals[id] = current with { Status = "done", Result = ticket };
+    Console.WriteLine($"APPROVAL done id={id} action={current.Action} result={ticket}");
+
+    return Results.Ok(new { id, action = current.Action, status = "done", result = ticket });
+});
 
 
 app.Run("http://0.0.0.0:8080");
@@ -619,3 +671,6 @@ static async Task LogRequest(
 
 
 record ChatIn(string Message);
+
+// W4: заявка HITL. Message — уже замаскований текст (PII не потрапляє в чергу).
+record Approval(string Id, string Action, string Message, string Status, string? Result, DateTimeOffset CreatedAt);
