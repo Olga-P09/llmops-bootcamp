@@ -110,8 +110,9 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     Console.WriteLine($"CACHE MISS model={model} prompt={promptVersion} request={requestId}");
 
     // fallback (W4): ідемо по ланцюгу моделей (див. FallbackChain).
-    // 429 / 5xx / мережа / нерозбірна відповідь → наступна модель; кожен перехід → fallbackEvents.
-    // усі впали → graceful degradation (DegradedAnswer, HTTP 200, не 500).
+    // лише 429 / 5xx / мережа / таймаут → наступна модель (див. Fallback); кожен перехід → fallbackEvents.
+    // 400 / 401 / 403 / 404 та інші 4xx — fallback не допоможе: зупиняємось, у лог іде реальний статус.
+    // fallback не вийшов або не застосовний → graceful degradation (DegradedAnswer, HTTP 200, не 500).
     var chain = FallbackChain(model, defaultModel);
 
     var http = httpFactory.CreateClient();
@@ -171,10 +172,17 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
             status = (int)response.StatusCode;
 
-            // 429 / 5xx (і будь-який не-2xx) — збій провайдера: пробуємо наступну модель
             if (!response.IsSuccessStatusCode)
             {
-                continue;
+                // 429 / 5xx — збій провайдера: пробуємо наступну модель
+                if (Fallback.IsRetryableStatus(status))
+                {
+                    continue;
+                }
+
+                // 400 / 401 / 403 / 404 … — той самий запит до іншої моделі теж не пройде: без fallback
+                Console.Error.WriteLine($"Model {respondedModel} returned non-retryable {status}, no fallback request={requestId}");
+                break;
             }
 
             var rawJson = await response.Content.ReadAsStringAsync();
@@ -220,17 +228,23 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
             modelOk = true;
         }
+        catch (Exception ex) when (Fallback.IsRetryableError(ex))
+        {
+            // мережа / таймаут — збій провайдера: наступна модель
+            Console.Error.WriteLine($"Model {respondedModel} failed: {ex.Message}");
+        }
         catch (Exception ex)
         {
-            // мережа/gateway недоступні або відповідь не розпарсилась — теж збій: наступна модель
-            Console.Error.WriteLine($"Model {respondedModel} failed: {ex.Message}");
+            // відповідь не розпарсилась — збій формату, не провайдера: без fallback (failure-scenarios #4)
+            Console.Error.WriteLine($"Model {respondedModel} returned unreadable response, no fallback: {ex.Message} request={requestId}");
+            break;
         }
     }
 
     if (!modelOk)
     {
-        // graceful degradation (W4): усі моделі ланцюга впали
-        Console.Error.WriteLine($"DEGRADED all models failed ({string.Join(" -> ", chain)}) request={requestId}");
+        // graceful degradation (W4): fallback вичерпано або збій не підлягає fallback
+        Console.Error.WriteLine($"DEGRADED last model={respondedModel} status={status} chain=({string.Join(" -> ", chain)}) request={requestId}");
         answer = DegradedAnswer;
         toolCall = null;
     }
