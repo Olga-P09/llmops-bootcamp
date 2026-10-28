@@ -166,6 +166,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             }
         });
 
+        bool? providerSucceeded = null;
         try
         {
             var response = await http.PostAsync(
@@ -184,7 +185,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
                 // 429 / 5xx — збій провайдера: пробуємо наступну модель
                 if (Fallback.IsRetryableStatus(status))
                 {
-                    providerHealth.RecordFailure(respondedModel); // W5
+                    providerSucceeded = false;
                     continue;
                 }
 
@@ -237,12 +238,12 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             modelOk = true;
 
             // W5: модель реально відповіла — скидаємо статус лише їй (cache hit сюди не доходить)
-            providerHealth.RecordSuccess(respondedModel);
+            providerSucceeded = true;
         }
         catch (Exception ex) when (Fallback.IsRetryableError(ex))
         {
             // мережа / таймаут — збій провайдера: наступна модель
-            providerHealth.RecordFailure(respondedModel); // W5
+            providerSucceeded = false;
             Console.Error.WriteLine($"Model {respondedModel} failed: {ex.Message}");
         }
         catch (Exception ex)
@@ -250,6 +251,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             // відповідь не розпарсилась — збій формату, не провайдера: без fallback (failure-scenarios #4)
             Console.Error.WriteLine($"Model {respondedModel} returned unreadable response, no fallback: {ex.Message} request={requestId}");
             break;
+        }
+        finally
+        {
+            // Every provider attempt refreshes this model, including non-retryable errors.
+            providerHealth.RecordCheck(respondedModel, providerSucceeded);
         }
     }
 
@@ -576,12 +582,12 @@ app.MapGet("/cost", () => WithDb("read today's cost", async () =>
     });
 }));
 
-// W5: { providers: [ { name, status } ] }
+// W5: { providers: [ { name, status, last_checked_at } ] }
 // status: ok / degraded (1–2 retryable-збої поспіль) / down (≥3) — див. ProviderHealth.
 app.MapGet("/providers", () => Results.Json(new
 {
     providers = providerHealth.Snapshot()
-        .Select(p => new { name = p.Name, status = p.Status })
+        .Select(p => new { name = p.Name, status = p.Status, last_checked_at = p.LastCheckedAt })
 }));
 
 // W4: { pending: [ { id, action } ] } + done: виконані заявки з result (номер тікета) —

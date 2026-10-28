@@ -10,26 +10,34 @@ public sealed class ProviderHealth
 {
     public const int DownThreshold = 3;
 
-    private readonly ConcurrentDictionary<string, int> _failures = new();
-    private readonly List<string> _order = new();
+    private sealed record State(int Failures, DateTimeOffset? LastCheckedAt);
 
-    public ProviderHealth(IEnumerable<string> models)
+    private readonly ConcurrentDictionary<string, State> _states = new();
+    private readonly List<string> _order = new();
+    private readonly TimeProvider _timeProvider;
+
+    public ProviderHealth(IEnumerable<string> models, TimeProvider? timeProvider = null)
     {
+        _timeProvider = timeProvider ?? TimeProvider.System;
         foreach (var model in models)
         {
-            if (_failures.TryAdd(model, 0))
+            if (_states.TryAdd(model, new State(0, null)))
                 _order.Add(model);
         }
     }
 
-    public void RecordFailure(string model)
-    {
-        _failures.AddOrUpdate(model, 1, (_, n) => n + 1);
-    }
+    public void RecordFailure(string model) => RecordCheck(model, false);
 
-    public void RecordSuccess(string model)
+    public void RecordSuccess(string model) => RecordCheck(model, true);
+
+    // A null outcome records a call without changing the retryable failure streak.
+    public void RecordCheck(string model, bool? succeeded = null)
     {
-        _failures[model] = 0;
+        _states.AddOrUpdate(model,
+            _ => new State(succeeded == false ? 1 : 0, _timeProvider.GetUtcNow()),
+            (_, state) => new State(
+                succeeded switch { true => 0, false => state.Failures + 1, null => state.Failures },
+                _timeProvider.GetUtcNow()));
     }
 
     public static string StatusFor(int consecutiveFailures) => consecutiveFailures switch
@@ -40,9 +48,13 @@ public sealed class ProviderHealth
     };
 
     public string StatusOf(string model) =>
-        StatusFor(_failures.TryGetValue(model, out var n) ? n : 0);
+        StatusFor(_states.TryGetValue(model, out var state) ? state.Failures : 0);
 
     // порядок — як моделі передали в конструктор, щоб картка в консолі не «стрибала»
-    public IReadOnlyList<(string Name, string Status)> Snapshot() =>
-        _order.Select(m => (m, StatusOf(m))).ToList();
+    public IReadOnlyList<(string Name, string Status, DateTimeOffset? LastCheckedAt)> Snapshot() =>
+        _order.Select(m =>
+        {
+            var state = _states[m];
+            return (m, StatusFor(state.Failures), state.LastCheckedAt);
+        }).ToList();
 }

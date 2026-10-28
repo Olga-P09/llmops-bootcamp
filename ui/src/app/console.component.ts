@@ -51,7 +51,12 @@ import { catchError } from 'rxjs/operators';
     <div class="card">
       <div class="ch">Надійність провайдерів <span class="lens">L07</span></div>
       <ng-container *ngIf="providers?.length; else emptyH">
-        <div class="prov" *ngFor="let p of providers"><span class="dot" [class.down]="p.status !== 'ok'"></span>{{ p.name }} · {{ p.status }}</div>
+        <div class="prov" *ngFor="let p of providers">
+          <span class="dot" [class.down]="p.status !== 'ok'"></span>
+          <div>{{ p.name }} · {{ p.status }}
+            <div class="last-checked">{{ p.last_checked_at ? 'Last checked: ' + (p.last_checked_at | date:'medium') : 'Never checked' }}</div>
+          </div>
+        </div>
       </ng-container>
       <ng-template #emptyH><div class="empty">— очікує GET /providers (HW5)</div></ng-template>
     </div>
@@ -98,6 +103,7 @@ import { catchError } from 'rxjs/operators';
       .prov { display: flex; align-items: center; font-size: 13px; padding: 4px 0; }
       .dot { width: 8px; height: 8px; border-radius: 50%; background: #177245; display: inline-block; margin-right: 8px; }
       .dot.down { background: #b3261e; }
+      .last-checked { font-size: 12px; color: #565c6b; margin-top: 2px; }
       .empty { font-size: 13px; color: #a0a4b0; }
       .foot { font-size: 12px; color: #a0a4b0; margin: 4px 0 0; }
     `,
