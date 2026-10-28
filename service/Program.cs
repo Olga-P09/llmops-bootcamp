@@ -35,16 +35,31 @@ var cache = new ConcurrentDictionary<string, string>();
 long cacheHits = 0;
 long cacheMisses = 0;  // знадобляться для плитки cache-hit % (W5)
 
+// [W4] кожен перехід між моделями у fallback-ланцюгу — з нього живе плитка «Fallback» (W5)
+long fallbackEvents = 0;
+
+// [W4] graceful degradation: усі моделі ланцюга впали. чесно, без вигаданих фактів
+// (ні статусу, ні номера, ні «зроблено») і не стартерний текст.
+const string DegradedAnswer =
+    "Вибачте, зараз у нас тимчасова проблема з відповідями. Спробуйте, будь ласка, трохи пізніше.";
+
+// [W4] HITL: черга заявок на незворотні дії (create_ticket). id заявки = request_id запиту чату.
+// стан заявки: pending → executing → done; перехід pending → executing атомарний (див. approve).
+var approvals = new ConcurrentDictionary<string, Approval>();
+long ticketSeq = 1000; // mock-нумерація тікетів: TICKET-1001, TICKET-1002, ...
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // guardrails (W4): PII маскуємо на вході сервісу — ДО routing, ключа кешу, виклику моделі й черги approvals.
+    // далі в /chat використовується лише userMessage; сирий body.Message нікуди не йде.
+    // (вхідний детект prompt injection — опційна частина hw4, не реалізовано)
+    var userMessage = MaskPii(body.Message);
 
     // routing (W2): скарги / повернення / терміново → mock-strong, решта → mock-mini (див. Route)
-    var model = Route(body.Message, defaultModel);
+    var model = Route(userMessage, defaultModel);
 
     // W1: беремо активний prompt із registry
     string promptVersion;
@@ -71,11 +86,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     // cache (W3): перед викликом глянути в in-memory exact cache — раптом вже відповідали.
-    // ключ = model + повний текст systemPrompt + body.Message (зміна будь-чого з трьох → інший ключ).
-    // \u001F — роздільник, якого немає у звичайному тексті: "ab"+"c" і "a"+"bc" дають різні ключі.
-    var cacheKey = string.Join('\u001F', model, systemPrompt, body.Message);
-
-    if (cache.TryGetValue(cacheKey, out var cachedAnswer))
+    if (cache.TryGetValue(CacheKey(model, systemPrompt, userMessage), out var cachedAnswer))
     {
         Interlocked.Increment(ref cacheHits);
 
@@ -98,107 +109,164 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     Interlocked.Increment(ref cacheMisses);
     Console.WriteLine($"CACHE MISS model={model} prompt={promptVersion} request={requestId}");
 
-    // fallback (W4): якщо 429/5xx — піти на іншого провайдера
-    // TODO(student, W4)
-
-    var payload = JsonSerializer.Serialize(new
-    {
-        model,
-        messages = new object[]
-        {
-            new
-            {
-                role = "system",
-                content = systemPrompt
-            },
-            new
-            {
-                role = "user",
-                content = body.Message
-            }
-        }
-    });
+    // fallback (W4): ідемо по ланцюгу моделей (див. FallbackChain).
+    // лише 429 / 5xx / мережа / таймаут → наступна модель (див. Fallback); кожен перехід → fallbackEvents.
+    // 400 / 401 / 403 / 404 та інші 4xx — fallback не допоможе: зупиняємось, у лог іде реальний статус.
+    // fallback не вийшов або не застосовний → graceful degradation (DegradedAnswer, HTTP 200, не 500).
+    var chain = FallbackChain(model, defaultModel);
 
     var http = httpFactory.CreateClient();
 
     var answer = "";
     string? toolCall = null;
+    var respondedModel = model; // модель, що реально відповіла (при повному збої — остання спробувана)
 
     int promptTokens = 0;
     int completionTokens = 0;
     int status = 0; // 0 = відповіді не було
     bool modelOk = false; // true лише якщо відповідь моделі повністю розібрана
 
-    try
+    for (var attempt = 0; attempt < chain.Length && !modelOk; attempt++)
     {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(
-                payload,
-                Encoding.UTF8,
-                "application/json"
-            )
-        );
-
-        status = (int)response.StatusCode;
-
-        var rawJson = await response.Content.ReadAsStringAsync();
-
-        using var doc = JsonDocument.Parse(rawJson);
-
-        var message = doc.RootElement
-            .GetProperty("choices")[0]
-            .GetProperty("message");
-
-        answer = message
-            .GetProperty("content")
-            .GetString() ?? "";
-
-        // tools (W3): lookup_order виконуємо і підклеюємо результат до відповіді.
-        // HITL (W4): create_ticket — незворотна дія, тут НЕ виконується (черга approvals).
-        // TODO(student, W4)
-        if (
-            message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array
-            && tools.GetArrayLength() > 0
-        )
+        if (attempt > 0)
         {
-            toolCall = tools[0]
-                .GetProperty("function")
-                .GetProperty("name")
-                .GetString();
-
-            if (toolCall == "lookup_order")
-            {
-                answer += $" (статус: {RunTool(toolCall)})";
-            }
+            Interlocked.Increment(ref fallbackEvents);
+            Console.WriteLine($"FALLBACK {chain[attempt - 1]} -> {chain[attempt]} (status={status}) request={requestId}");
         }
 
-        var usage = doc.RootElement.GetProperty("usage");
+        respondedModel = chain[attempt];
+        answer = "";
+        toolCall = null;
+        promptTokens = 0;
+        completionTokens = 0;
+        status = 0;
 
-        promptTokens = usage
-            .GetProperty("prompt_tokens")
-            .GetInt32();
+        var payload = JsonSerializer.Serialize(new
+        {
+            model = respondedModel,
+            messages = new object[]
+            {
+                new
+                {
+                    role = "system",
+                    content = systemPrompt
+                },
+                new
+                {
+                    role = "user",
+                    content = userMessage
+                }
+            }
+        });
 
-        completionTokens = usage
-            .GetProperty("completion_tokens")
-            .GetInt32();
+        try
+        {
+            var response = await http.PostAsync(
+                $"{gateway}/v1/chat/completions",
+                new StringContent(
+                    payload,
+                    Encoding.UTF8,
+                    "application/json"
+                )
+            );
 
-        modelOk = true;
+            status = (int)response.StatusCode;
+
+            if (!response.IsSuccessStatusCode)
+            {
+                // 429 / 5xx — збій провайдера: пробуємо наступну модель
+                if (Fallback.IsRetryableStatus(status))
+                {
+                    continue;
+                }
+
+                // 400 / 401 / 403 / 404 … — той самий запит до іншої моделі теж не пройде: без fallback
+                Console.Error.WriteLine($"Model {respondedModel} returned non-retryable {status}, no fallback request={requestId}");
+                break;
+            }
+
+            var rawJson = await response.Content.ReadAsStringAsync();
+
+            using var doc = JsonDocument.Parse(rawJson);
+
+            var message = doc.RootElement
+                .GetProperty("choices")[0]
+                .GetProperty("message");
+
+            answer = message
+                .GetProperty("content")
+                .GetString() ?? "";
+
+            // tools (W3): lookup_order виконуємо і підклеюємо результат до відповіді.
+            // HITL (W4): create_ticket — незворотна дія, тут НЕ виконується: після циклу стає в чергу approvals.
+            if (
+                message.TryGetProperty("tool_calls", out var tools)
+                && tools.ValueKind == JsonValueKind.Array
+                && tools.GetArrayLength() > 0
+            )
+            {
+                toolCall = tools[0]
+                    .GetProperty("function")
+                    .GetProperty("name")
+                    .GetString();
+
+                if (toolCall == "lookup_order")
+                {
+                    answer += $" (статус: {RunTool(toolCall)})";
+                }
+            }
+
+            var usage = doc.RootElement.GetProperty("usage");
+
+            promptTokens = usage
+                .GetProperty("prompt_tokens")
+                .GetInt32();
+
+            completionTokens = usage
+                .GetProperty("completion_tokens")
+                .GetInt32();
+
+            modelOk = true;
+        }
+        catch (Exception ex) when (Fallback.IsRetryableError(ex))
+        {
+            // мережа / таймаут — збій провайдера: наступна модель
+            Console.Error.WriteLine($"Model {respondedModel} failed: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            // відповідь не розпарсилась — збій формату, не провайдера: без fallback (failure-scenarios #4)
+            Console.Error.WriteLine($"Model {respondedModel} returned unreadable response, no fallback: {ex.Message} request={requestId}");
+            break;
+        }
     }
-    catch
+
+    if (!modelOk)
     {
-        // мережа/gateway недоступні або відповідь не розпарсилась
-        // TODO(student, W4): graceful degradation
-        answer = "Сервіс тимчасово недоступний.";
+        // graceful degradation (W4): fallback вичерпано або збій не підлягає fallback
+        Console.Error.WriteLine($"DEGRADED last model={respondedModel} status={status} chain=({string.Join(" -> ", chain)}) request={requestId}");
+        answer = DegradedAnswer;
+        toolCall = null;
+    }
+
+    // HITL (W4): create_ticket не виконуємо — лише ставимо заявку в чергу (єдина точка HITL-гейту).
+    // тікет створить тільки POST /approvals/{id}/approve; до того ні номера, ні «зроблено» у відповіді.
+    if (modelOk && toolCall == "create_ticket")
+    {
+        var approvalId = requestId.ToString();
+        approvals[approvalId] = new Approval(approvalId, "create_ticket", userMessage, "pending", null, DateTimeOffset.UtcNow);
+        Console.WriteLine($"APPROVAL pending id={approvalId} action=create_ticket");
+        // текст моделі («Створюю тікет…») замінюємо: до approve дію не виконано, і відповідь не має це приховувати
+        answer = "Заявку на створення тікета передано оператору на підтвердження. Тікет ще не створено — його створять після підтвердження.";
     }
 
     // cache (W3): кладемо лише успішну відповідь без tool_call.
     // помилку не кешуємо — інакше один збій «застрягне» для цього питання до рестарту;
     // tool_call не кешуємо — дію/дані інструмента треба отримувати щоразу заново.
+    // ключ — від моделі, що реально відповіла: відповідь резервної моделі не видаємо за відповідь основної.
     if (modelOk && status == 200 && toolCall is null)
     {
-        cache[cacheKey] = answer;
+        cache[CacheKey(respondedModel, systemPrompt, userMessage)] = answer;
     }
 
     var latencyMs =
@@ -209,7 +277,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // 0 у логах — лише для cache hit, тож збій не виглядає як влучання в кеш.
     decimal? costUsd = null;
 
-    if (modelOk && prices.TryGetValue(model, out var price))
+    if (modelOk && prices.TryGetValue(respondedModel, out var price))
     {
         costUsd = Math.Round(
             promptTokens / 1000m * price.InPer1K
@@ -219,10 +287,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     // W1: записуємо prompt_version у unified log
+    // W4: model = та, що реально відповіла (після fallback), а не та, яку обрав routing
     await LogRequest(
         dbConn,
         requestId,
-        model,
+        respondedModel,
         promptVersion,
         latencyMs,
         promptTokens,
@@ -242,7 +311,6 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 });
 
 // W2: routing policy — обрати модель за текстом запиту (лише в mock-режимі).
-// TODO(student, W4): fallback chain mock-strong -> mock-mini -> controlled error. НЕ реалізовано.
 // TODO(student, W5): budget alert при 80% денного бюджету (routing не змінюємо). НЕ реалізовано.
 static string Route(string message, string defaultModel)
 {
@@ -262,6 +330,24 @@ static string Route(string message, string defaultModel)
     return escalation ? "mock-strong" : "mock-mini";
 }
 
+// W4: fallback-ланцюг — спершу модель від routing, далі резервний аліас із litellm-config.yaml
+// (mock-strong ↔ mock-mini); після останнього — graceful degradation.
+// реальна модель (MODEL=...): резервної моделі в конфігу не задано, тож лише вона сама.
+static string[] FallbackChain(string routed, string defaultModel)
+{
+    if (defaultModel != "mock")
+        return new[] { routed };
+
+    return routed == "mock-strong"
+        ? new[] { "mock-strong", "mock-mini" }
+        : new[] { "mock-mini", "mock-strong" };
+}
+
+// W3: ключ кешу = model + повний текст systemPrompt + повідомлення (зміна будь-чого → інший ключ).
+// \u001F — роздільник, якого немає у звичайному тексті: "ab"+"c" і "a"+"bc" дають різні ключі.
+static string CacheKey(string model, string systemPrompt, string message) =>
+    string.Join('\u001F', model, systemPrompt, message);
+
 // W3: виконати інструмент, який попросила модель. результат — mock, без реальної системи замовлень.
 // викликається лише для lookup_order (read-only); create_ticket сюди не потрапляє (W4, HITL).
 static string RunTool(string name) => name switch
@@ -269,6 +355,11 @@ static string RunTool(string name) => name switch
     "lookup_order" => "в дорозі",
     _ => throw new ArgumentException($"Unknown tool: {name}", nameof(name))
 };
+
+// W4: guardrail PII — email → [email] (regex з GETTING_STARTED §10).
+// викликається на вході /chat, до routing, ключа кешу, виклику моделі й черги approvals.
+static string MaskPii(string s) =>
+    System.Text.RegularExpressions.Regex.Replace(s, @"[\w.\-]+@[\w.\-]+", "[email]");
 
 // ======================================================
 // Prompt Registry
@@ -446,13 +537,44 @@ app.MapGet(
     )
 );
 
-// W4: { pending: [ { id, action } ] }
-app.MapGet(
-    "/approvals",
-    () => Results.Json(
-        new { todo = "pending HITL approvals" }
-    )
-);
+// W4: { pending: [ { id, action } ] } + done: виконані заявки з result (номер тікета) —
+// спостережуваний слід «рівно один тікет» після approve.
+app.MapGet("/approvals", () =>
+{
+    var all = approvals.Values.OrderBy(a => a.CreatedAt).ToList();
+
+    return Results.Json(new
+    {
+        pending = all
+            .Where(a => a.Status == "pending")
+            .Select(a => new { id = a.Id, action = a.Action, message = a.Message, created_at = a.CreatedAt }),
+        done = all
+            .Where(a => a.Status == "done")
+            .Select(a => new { id = a.Id, action = a.Action, message = a.Message, result = a.Result, created_at = a.CreatedAt })
+    });
+});
+
+// W4: виконати незворотну дію після підтвердження людиною.
+// атомарний check-then-act: перехід pending → executing через TryUpdate (compare-and-swap).
+// з паралельних approve одного id перехід виграє лише один — він і створює тікет;
+// решта, як і повтор після виконання, отримують 404: заявку вже спожито
+// («вже виконано» і «не існувало» навмисно нерозрізненні — відповідь не підказує, які id існують).
+app.MapPost("/approvals/{id}/approve", (string id) =>
+{
+    if (!approvals.TryGetValue(id, out var current)
+        || current.Status != "pending"
+        || !approvals.TryUpdate(id, current with { Status = "executing" }, current))
+    {
+        return Results.NotFound(new { error = $"Approval '{id}' not found or already done." });
+    }
+
+    // mock-дія: «створюємо» тікет (у реальній системі — виклик тікет-системи з ключем ідемпотентності = id)
+    var ticket = $"TICKET-{Interlocked.Increment(ref ticketSeq)}";
+    approvals[id] = current with { Status = "done", Result = ticket };
+    Console.WriteLine($"APPROVAL done id={id} action={current.Action} result={ticket}");
+
+    return Results.Ok(new { id, action = current.Action, status = "done", result = ticket });
+});
 
 
 app.Run("http://0.0.0.0:8080");
@@ -564,3 +686,6 @@ static async Task LogRequest(
 
 
 record ChatIn(string Message);
+
+// W4: заявка HITL. Message — уже замаскований текст (PII не потрапляє в чергу).
+record Approval(string Id, string Action, string Message, string Status, string? Result, DateTimeOffset CreatedAt);
