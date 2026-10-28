@@ -38,6 +38,13 @@ long cacheMisses = 0;  // знадобляться для плитки cache-hit
 // [W4] кожен перехід між моделями у fallback-ланцюгу — з нього живе плитка «Fallback» (W5)
 long fallbackEvents = 0;
 
+// [W5] здоров'я провайдерів для GET /providers: моделі, які може викликати fallback-ланцюг.
+// mock-режим — обидва аліаси ланцюга; реальна модель — лише вона сама (див. FallbackChain).
+var providerHealth = new ProviderHealth(
+    defaultModel == "mock"
+        ? new[] { "mock-mini", "mock-strong" }
+        : new[] { defaultModel });
+
 // [W4] graceful degradation: усі моделі ланцюга впали. чесно, без вигаданих фактів
 // (ні статусу, ні номера, ні «зроблено») і не стартерний текст.
 const string DegradedAnswer =
@@ -159,6 +166,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             }
         });
 
+        bool? providerSucceeded = null;
         try
         {
             var response = await http.PostAsync(
@@ -177,6 +185,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
                 // 429 / 5xx — збій провайдера: пробуємо наступну модель
                 if (Fallback.IsRetryableStatus(status))
                 {
+                    providerSucceeded = false;
                     continue;
                 }
 
@@ -227,10 +236,14 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
                 .GetInt32();
 
             modelOk = true;
+
+            // W5: модель реально відповіла — скидаємо статус лише їй (cache hit сюди не доходить)
+            providerSucceeded = true;
         }
         catch (Exception ex) when (Fallback.IsRetryableError(ex))
         {
             // мережа / таймаут — збій провайдера: наступна модель
+            providerSucceeded = false;
             Console.Error.WriteLine($"Model {respondedModel} failed: {ex.Message}");
         }
         catch (Exception ex)
@@ -238,6 +251,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             // відповідь не розпарсилась — збій формату, не провайдера: без fallback (failure-scenarios #4)
             Console.Error.WriteLine($"Model {respondedModel} returned unreadable response, no fallback: {ex.Message} request={requestId}");
             break;
+        }
+        finally
+        {
+            // Every provider attempt refreshes this model, including non-retryable errors.
+            providerHealth.RecordCheck(respondedModel, providerSucceeded);
         }
     }
 
@@ -496,12 +514,47 @@ app.MapGet(
 );
 
 // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
-app.MapGet(
-    "/observability",
-    () => Results.Json(
-        new { todo = "aggregate from requests table" }
-    )
-);
+// requests / p95 / error rate — з таблиці requests за сьогодні, тими самими виразами,
+// якими їх звіряє ментор (тож округлення збігається). усі три — одним запитом, з одного зрізу.
+// cache-hit % і fallback — лічильники процесу (обнуляються при рестарті сервісу).
+// БД недоступна → 503 (WithDb), а не нулі: невідомий error rate ≠ 0%.
+// за сьогодні ще немає жодного рядка → p95 = 0 і error rate = 0 (COALESCE): 0 запитів — 0 помилок,
+// і плитки консолі завжди числові. NULLIF захищає від ділення на нуль.
+app.MapGet("/observability", () => WithDb("read observability", async () =>
+{
+    await using var conn = new NpgsqlConnection(dbConn);
+    await conn.OpenAsync();
+
+    await using var cmd = new NpgsqlCommand(
+        """
+        SELECT
+            count(*),
+            COALESCE(round(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)), 0),
+            COALESCE(round(100.0 * count(*) FILTER (WHERE status <> '200') / NULLIF(count(*), 0), 1), 0)
+        FROM requests
+        WHERE created_at::date = CURRENT_DATE
+        """,
+        conn
+    );
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    await reader.ReadAsync();
+
+    var requests = reader.GetInt64(0);
+    var p95Ms = (long)reader.GetDouble(1);
+    var errorRatePct = reader.GetDecimal(2);
+
+    return Results.Json(new
+    {
+        p95_ms = p95Ms,
+        requests,
+        cache_hit_pct = Observability.CacheHitPct(
+            Interlocked.Read(ref cacheHits),
+            Interlocked.Read(ref cacheMisses)),
+        error_rate_pct = errorRatePct,
+        fallback_events = Interlocked.Read(ref fallbackEvents)
+    });
+}));
 
 // W2/W5: { today_usd, budget_usd }
 // якщо БД недоступна — 503, а НЕ today_usd = 0: невідома витрата ≠ нульова.
@@ -529,13 +582,13 @@ app.MapGet("/cost", () => WithDb("read today's cost", async () =>
     });
 }));
 
-// W5: { providers: [ { name, status } ] }
-app.MapGet(
-    "/providers",
-    () => Results.Json(
-        new { todo = "provider health" }
-    )
-);
+// W5: { providers: [ { name, status, last_checked_at } ] }
+// status: ok / degraded (1–2 retryable-збої поспіль) / down (≥3) — див. ProviderHealth.
+app.MapGet("/providers", () => Results.Json(new
+{
+    providers = providerHealth.Snapshot()
+        .Select(p => new { name = p.Name, status = p.Status, last_checked_at = p.LastCheckedAt })
+}));
 
 // W4: { pending: [ { id, action } ] } + done: виконані заявки з result (номер тікета) —
 // спостережуваний слід «рівно один тікет» після approve.
