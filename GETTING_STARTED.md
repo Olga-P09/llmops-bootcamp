@@ -273,7 +273,7 @@ Eval прогоняє кейси з `golden.jsonl` через сервіс і р
 docker run --rm --network <project>_default \
   -e SERVICE_URL=http://service:8080 -e PYTHONUTF8=1 \
   -v "$(pwd)/evals:/e:ro" python:3.12-slim \
-  python /e/run.py --dataset /e/golden.jsonl --threshold 5
+  python /e/run.py --dataset /e/golden.jsonl --threshold 10
 ```
 
 `<project>` — префікс мережі (звичайно ім'я папки; глянь `docker network ls`).
@@ -288,7 +288,7 @@ docker run --rm --network <project>_default \
 MSYS_NO_PATHCONV=1 docker run --rm --network <project>_default \
   -e SERVICE_URL=http://service:8080 -e PYTHONUTF8=1 \
   -v "$(pwd -W)/evals:/e:ro" python:3.12-slim \
-  python /e/run.py --dataset /e/golden.jsonl --threshold 5
+  python /e/run.py --dataset /e/golden.jsonl --threshold 10
 ```
 
 `MSYS_NO_PATHCONV=1` захищає шляхи-аргументи контейнера, а `$(pwd -W)` дає
@@ -298,15 +298,15 @@ Windows-шлях джерела монтування, який Docker Desktop р
 Або з хоста (якщо `8080` вільний і без проксі):
 
 ```bash
-SERVICE_URL=http://localhost:8080 python evals/run.py --dataset evals/golden.jsonl --threshold 5
+SERVICE_URL=http://localhost:8080 python evals/run.py --dataset evals/golden.jsonl --threshold 10
 ```
 
 ```powershell
 # PowerShell-варіант того самого
-$env:SERVICE_URL="http://localhost:8080"; python evals/run.py --dataset evals/golden.jsonl --threshold 5
+$env:SERVICE_URL="http://localhost:8080"; python evals/run.py --dataset evals/golden.jsonl --threshold 10
 ```
 
-Вихід: `eval: 6/6 passed, threshold 5`, код виходу `0` (green) або `1` (red).
+Вихід: `eval: 11/11 passed, threshold 10`, код виходу `0` (green) або `1` (red).
 
 **Як гейт ловить регресію:** сервіс шле system-промпт зі словом «support» → mock віддає
 канонічні відповіді → evals зелені. Зламай промпт (прибери «support») → mock почне
