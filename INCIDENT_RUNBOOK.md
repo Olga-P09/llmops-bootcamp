@@ -2,15 +2,262 @@
 
 ## Purpose and scope
 
-Use this runbook to investigate an incident and manually restore a verified prompt version using the existing SupportGW API. It covers the bootcamp Compose stack: Angular Operator Console, .NET service, gateway, mock provider, and PostgreSQL. It does not deploy application releases or restore database backups.
+This runbook has two parts:
 
-**IMPLEMENTED** means behavior present in this repository. **PROPOSED / NOT IMPLEMENTED** means an operator policy or future capability, not an automatic safeguard. The recovery commands below change prompt activation only when an operator deliberately executes them against an identified environment.
+1. **Incident demo: provider outage → fallback → recovery.** A reproducible drill on a clean clone with the mock provider. Start here if you want to see the incident end to end.
+2. **Operations reference.** How to detect and classify an incident, and how to manually restore a verified prompt version with the existing SupportGW API.
 
-For this exercise, v1 (`You are an assistant.`) is deliberately bad and v2 (`You are a support assistant. Be concise and helpful.`) is the verified known-good prompt. Earlier local and CI verification produced v1: 6/11, exit 1; v2: 11/11, exit 0. Do not choose a rollback target solely because it is older, and do not assume these results certify a different production prompt or model.
+It covers the bootcamp Compose stack: Angular Operator Console, .NET service, LiteLLM gateway, mock provider, and PostgreSQL. It does not deploy application releases or restore database backups.
 
-## Environment identification and prerequisites
+**IMPLEMENTED** means the behavior exists in this repository. **PROPOSED / NOT IMPLEMENTED** means an operator policy or a future feature, not an automatic safeguard. The prompt recovery commands change prompt activation only when an operator runs them on purpose against an identified environment.
 
-Run the PowerShell examples in order, in one session, from the repository root. Prerequisites are Docker with Compose 2.24 or later (the shifted-port file uses `!override`), Python 3 available as `python`, access to the intended service and database, and operator authorization to change that environment. The stack must already be running. Do not start, restart, rebuild, stop, or reset it as an incidental part of prompt recovery. Stop if any command fails; a failed inspection is not permission to continue with activation.
+For this exercise, v1 (`You are an assistant.`) is a deliberately bad prompt, and v2 (`You are a support assistant. Be concise and helpful.`) is the verified good prompt. Earlier local and CI runs gave v1: 6/11, exit 1; v2: 11/11, exit 0. Do not choose a rollback target only because it is older. These results do not certify a different production prompt or model.
+
+## Environment and settings
+
+Prerequisites: Docker with Compose 2.24 or later (`demo-ports.yml` uses `!override`), `curl` (for bash and zsh), and Python 3 (only for the Golden Evals in Part 2).
+
+Run all commands from the repository root of the stack you mean to use. Compose takes the project name from the folder name. So a clean clone in a new folder gets its own containers and its own database volume. You don't need a `-p` flag.
+
+**Do not run the incident demo on your working stack.** It adds failed requests to today's metrics and marks both mock models as `down` until each one answers again. Use a clean clone. Two stacks can't use the same host ports. Either stop the other stack first (`docker compose down` in its folder, without `-v`), or start the clean clone with shifted ports.
+
+| Setting | Default ports (`docker-compose.yml`) | Shifted ports (`+ demo-ports.yml`) |
+|---|---|---|
+| Start command | `docker compose up --build -d` | `docker compose -f docker-compose.yml -f demo-ports.yml up --build -d` |
+| Service API | `http://localhost:8080` | `http://localhost:8180` |
+| Gateway | `http://localhost:4000` | `http://localhost:4100` |
+| Operator Console | `http://localhost:4200` | `http://localhost:4300` |
+
+The commands below use the default ports. If you started with shifted ports, change only the settings lines, as shown in the comments. Commands like `docker compose logs` and `docker compose exec` work the same with both options, because the project (folder) is the same and they don't use host ports.
+
+**bash or zsh** (Linux, macOS, WSL, Git Bash):
+
+```bash
+SERVICE_URL=http://localhost:8080   # shifted ports: http://localhost:8180
+GATEWAY_URL=http://localhost:4000   # shifted ports: http://localhost:4100
+CONSOLE_URL=http://localhost:4200   # shifted ports: http://localhost:4300
+```
+
+**PowerShell** (Windows):
+
+```powershell
+$serviceUrl = 'http://localhost:8080'   # shifted ports: 'http://localhost:8180'
+$gatewayUrl = 'http://localhost:4000'   # shifted ports: 'http://localhost:4100'
+$consoleUrl = 'http://localhost:4200'   # shifted ports: 'http://localhost:4300'
+$composeArgs = @()                      # shifted ports: @('-f', 'docker-compose.yml', '-f', 'demo-ports.yml')
+```
+
+## Part 1. Incident demo: provider outage → fallback → recovery
+
+**Scenario.** The LLM provider starts returning HTTP 503. The mock provider fails on purpose when the user message contains `__fail_503`, and it fails for both mock models (`mock-mini` and `mock-strong`). This is what SupportGW does (all IMPLEMENTED, see [service/Program.cs](service/Program.cs)):
+
+- The first model returns 503. The service moves to the next model in the chain, and `fallback_events` goes up by 1.
+- The backup model also returns 503. The user gets the polite degraded answer (`Вибачте, зараз у нас тимчасова проблема з відповідями…`) with HTTP 200, not a 500.
+- The request is logged with a 5xx status, so `error_rate_pct` goes up. Each model's failure streak grows: 1–2 failures → `degraded`, 3 or more → `down`.
+- Failed answers are never cached.
+
+**Recovery** means that after the outage, a **new** question (never asked before, so not in the cache) gets a normal answer from the model. `error_rate_pct` then goes down. `fallback_events` is a cumulative counter, so it never goes down. It keeps showing the spike. A repeated question is not proof of recovery: the cache answers it without calling any model (`cached: true`, latency close to 0).
+
+### Step 1. Start a clean clone
+
+```bash
+git clone https://github.com/Olga-P09/llmops-bootcamp.git supportgw-clean
+cd supportgw-clean
+git checkout homework/week6   # only while PR #7 is open; after the merge, stay on main
+docker compose up --build -d
+```
+
+If the default ports are busy, use the shifted-ports start command from the table above instead of the last line. Then run the settings block for your shell from [Environment and settings](#environment-and-settings), in the same terminal.
+
+### Step 2. Wait until the service and the gateway are ready
+
+A cold LiteLLM gateway can fail the first request. We warm it up directly (like the CI workflow does), so the warm-up does not change the service metrics.
+
+bash or zsh:
+
+```bash
+for i in $(seq 1 40); do if curl -sf "$SERVICE_URL/health"; then echo; break; fi; sleep 5; done
+for i in $(seq 1 40); do
+  code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$GATEWAY_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"mock","messages":[{"role":"user","content":"hi"}]}')
+  if [ "$code" = "200" ]; then echo "gateway ready"; break; fi
+  sleep 5
+done
+```
+
+PowerShell:
+
+```powershell
+foreach ($i in 1..40) { try { Invoke-RestMethod "$serviceUrl/health" | Out-Null; 'service ready'; break } catch { Start-Sleep 5 } }
+$gatewayBody = '{"model":"mock","messages":[{"role":"user","content":"hi"}]}'
+foreach ($i in 1..40) { try { Invoke-RestMethod -Method Post -Uri "$gatewayUrl/v1/chat/completions" -ContentType 'application/json' -Body $gatewayBody | Out-Null; 'gateway ready'; break } catch { Start-Sleep 5 } }
+```
+
+Expected: `{"status":"ok"}` (or `service ready`), then `gateway ready`.
+
+### Step 3. Define helper commands
+
+`chat` sends one message to `POST /chat`. `state` prints the console metrics and the provider health. `RUN_ID` makes every demo question unique, so you can repeat the demo and the questions will still not be cached.
+
+bash or zsh (the message body goes to `curl` through stdin, so Ukrainian text also arrives correctly in Git Bash on Windows):
+
+```bash
+RUN_ID=$(date +%Y%m%d%H%M%S)
+chat() {
+  printf '{"message": "%s"}' "$1" | curl -s -X POST "$SERVICE_URL/chat" \
+    -H "Content-Type: application/json" --data-binary @-; echo
+}
+state() {
+  curl -s "$SERVICE_URL/observability"; echo
+  curl -s "$SERVICE_URL/providers"; echo
+}
+```
+
+PowerShell:
+
+```powershell
+$runId = Get-Date -Format 'yyyyMMddHHmmss'
+function chat([string]$Message) {
+  $json = @{ message = $Message } | ConvertTo-Json -Compress
+  Invoke-RestMethod -Method Post -Uri "$serviceUrl/chat" -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json)) | Format-List content, cached, latency_ms, request_id
+}
+function state {
+  Invoke-RestMethod "$serviceUrl/observability" | Format-List
+  (Invoke-RestMethod "$serviceUrl/providers").providers | Format-Table name, status, last_checked_at
+}
+```
+
+### Step 4. Baseline: a normal question works
+
+bash or zsh:
+
+```bash
+chat "Привіт, перевірка перед інцидентом $RUN_ID"
+state
+```
+
+PowerShell:
+
+```powershell
+chat "Привіт, перевірка перед інцидентом $runId"
+state
+```
+
+Expected: `content` is the greeting `Вітаю! Розкажіть, що сталося — допоможу розібратися.`, and `cached` is `false`. In the metrics, `fallback_events` is 0 and `error_rate_pct` is 0. `mock-mini` is `ok` and has a `last_checked_at` time. `mock-strong` is `ok` with `last_checked_at: null` (not called yet).
+
+### Step 5. Incident: the provider returns 503
+
+Send three failing requests, then check the metrics and the service log.
+
+bash or zsh:
+
+```bash
+for i in 1 2 3; do chat "__fail_503 How do I reset my password? $RUN_ID"; done
+state
+docker compose logs --since 10m service | grep -E "FALLBACK|DEGRADED"
+```
+
+PowerShell:
+
+```powershell
+foreach ($i in 1..3) { chat "__fail_503 How do I reset my password? $runId" }
+state
+docker compose @composeArgs logs --since 10m service | Select-String 'FALLBACK|DEGRADED'
+```
+
+Expected:
+
+- Each answer is the degraded message `Вибачте, зараз у нас тимчасова проблема з відповідями. Спробуйте, будь ласка, трохи пізніше.`, with `cached: false`. The service does not return an error to the user.
+- `fallback_events` went up by 3 (one `mock-mini -> mock-strong` transition per request).
+- `error_rate_pct` went up (75.0 on a fresh clone, see the timeline below).
+- Both `mock-mini` and `mock-strong` are `down` (3 failures in a row each).
+- The log has three `FALLBACK mock-mini -> mock-strong` lines and three `DEGRADED` lines with `chain=(mock-mini -> mock-strong)`. The `status=` value in these lines is the gateway's 5xx code (503 is expected).
+
+Now open the Operator Console (`$CONSOLE_URL` / `$consoleUrl`, Console view, refreshes every 4 seconds). The **Error rate** tile is red (above 5%). The **Fallback** tile shows the spike. Both providers show `down`.
+
+### Step 6. Recovery: new questions get normal answers
+
+The outage ends when messages no longer contain `__fail_503`. Ask two **new** questions. The first one goes to `mock-mini`. The second one contains `скарга` (complaint), so routing sends it to `mock-strong`. This way each model proves its own recovery: a model's `down` status is reset only by its own successful call.
+
+bash or zsh:
+
+```bash
+chat "Привіт, перевірка після інциденту $RUN_ID"
+chat "У мене скарга, перевірка резервної моделі $RUN_ID"
+state
+```
+
+PowerShell:
+
+```powershell
+chat "Привіт, перевірка після інциденту $runId"
+chat "У мене скарга, перевірка резервної моделі $runId"
+state
+```
+
+Expected:
+
+- First answer: `Вітаю! Розкажіть, що сталося — допоможу розібратися.`, `cached: false`.
+- Second answer: `Уточніть, будь ласка, деталі — і я допоможу.`, `cached: false`. No ticket and no approval is created.
+- `error_rate_pct` went down compared to Step 5.
+- `fallback_events` did not change (cumulative counter).
+- Both providers are `ok` again, with newer `last_checked_at` times.
+
+In the console, the Error rate tile shows a lower value, the Fallback tile keeps the spike, and both providers are `ok`.
+
+### Step 7 (optional). Why the recovery question must be new
+
+Repeat the first recovery question:
+
+bash or zsh:
+
+```bash
+chat "Привіт, перевірка після інциденту $RUN_ID"
+state
+```
+
+PowerShell:
+
+```powershell
+chat "Привіт, перевірка після інциденту $runId"
+state
+```
+
+Expected: the same answer with `cached: true` and `latency_ms` close to 0. `cache_hit_pct` is now above 0. The cache answered without calling any model. That's why a repeated question can look "green" in the middle of an outage, and why recovery is checked only with new questions.
+
+### Expected timeline on a fresh clone
+
+The numbers assume that the demo is the only traffic in this database today (a clean clone, steps run once, in order). `error_rate_pct` and `requests` count today's rows in the `requests` table (PostgreSQL `CURRENT_DATE`). `fallback_events` and `cache_hit_pct` are process counters, and a service restart resets them. If the database already has traffic from today, the exact numbers will be different, but the direction must be the same.
+
+| Time | Event | requests | error_rate_pct | fallback_events | cache_hit_pct | mock-mini | mock-strong |
+|---|---|---|---|---|---|---|---|
+| T0 | Baseline question (Step 4) | 1 | 0.0 | 0 | 0 | ok | ok (never checked) |
+| T1 | 3 × `__fail_503` (Step 5) | 4 | 75.0 | 3 | 0 | down | down |
+| T2 | 2 new questions (Step 6) | 6 | 50.0 | 3 | 0 | ok | ok |
+| T3 | Repeated question, cache hit (Step 7) | 7 | 42.9 | 3 | 14.3 | ok | ok |
+
+To keep evidence for the incident record, save the output of `state` after each step and take a console screenshot at T1 and T2. To find the demo rows in the request log (the same command works in bash, zsh, and PowerShell):
+
+```bash
+docker compose exec -T postgres psql -U llmops -d llmops -c "SELECT created_at, model, prompt_version, latency_ms, cost_usd, status FROM requests ORDER BY created_at DESC LIMIT 10;"
+```
+
+Expected: the three incident rows have `model = mock-strong` (the last model tried), a 5xx `status`, and empty `cost_usd` (unknown cost, not 0). The recovery rows have `status = 200` and a cost. The cache-hit row has `cost_usd = 0`.
+
+### Step 8. Stop the clean clone
+
+```bash
+docker compose down
+```
+
+Run it in the clean clone folder. It works for both port options. Without `-v`, the database volume is kept. The volume belongs only to this clone and does not touch your working stack.
+
+## Part 2. Operations reference
+
+### Identify the environment
+
+Run the PowerShell examples in order, in one session, from the repository root, after the settings block from [Environment and settings](#environment-and-settings). You need access to the intended service and database, and operator authorization to change that environment. The stack must already be running. Do not start, restart, rebuild, stop, or reset it as a side step of prompt recovery. Stop if any command fails. A failed check does not give permission to continue with activation.
 
 First inspect the environment without making changes:
 
@@ -22,18 +269,15 @@ docker compose ls
 docker ps --format '{{.Names}} {{.Ports}}'
 ```
 
-The following settings identify the existing local project with shifted ports. Confirm them against the inventory above before continuing:
+Confirm that the settings match the stack you mean to work on:
 
 ```powershell
-$serviceUrl = 'http://localhost:8180'
-$consoleUrl = 'http://localhost:4300'
-$composeArgs = @('-p', 'llmops-bootcamp', '-f', 'docker-compose.yml', '-f', 'demo-ports.yml')
 docker compose @composeArgs ps
 docker compose @composeArgs port service 8080
 docker compose @composeArgs port postgres 5432
 ```
 
-For a stack using only the default Compose file, explicitly replace these settings with service URL `http://localhost:8080`, console URL `http://localhost:4200`, and `$composeArgs = @('-p', 'llmops-bootcamp', '-f', 'docker-compose.yml')`. If the project name differs, replace `llmops-bootcamp` with the verified name. Stop if ports, project, or database identity do not match the intended environment. An isolated exercise must use its own confirmed project and database, not these working-stack defaults.
+Stop if the project (folder), ports, or database don't match the intended environment.
 
 Record the project, URLs, Git SHA, incident start time in UTC, configured model, and database volume identity in the incident record. Inspect mounts without exposing gateway credentials:
 
@@ -158,7 +402,7 @@ if ($evalExitCode -ne 0) { throw 'Golden Evals failed; record the output and inv
 
 Record the actual score printed by the runner and the exit code. For mock v2, the verified baseline is 11/11 and exit 0; the gate passes at 10/11. If the exit code is nonzero, do not declare recovery: investigate failed cases, readiness, and logs without changing the dataset, grader, or threshold. Do not repeatedly switch prompt versions without evidence.
 
-Evals send real `/chat` requests: they add request logs/cost observations, affect counters/cache, and can create pending mock ticket approvals. They do not approve those tickets. Use the isolated exercise environment for repeatable destructive-failure demonstrations; production validation needs a separately approved test policy.
+Evals send real `/chat` requests: they add request logs/cost observations, affect counters/cache, and can create pending mock ticket approvals. They do not approve those tickets. Use a clean clone (see [Part 1](#part-1-incident-demo-provider-outage--fallback--recovery)) for repeatable failure demos; production validation needs a separately approved test policy.
 
 ### 5. Verify a fresh functional response, logs, and metrics
 
@@ -250,6 +494,7 @@ There is no exposed cache bypass/clear API, cache TTL, persistent provider healt
 - [Fallback eligibility](service/Fallback.cs)
 - [Database schema and fresh initialization defaults](db/schema.sql)
 - [Operator Console](ui/src/app/console.component.ts)
+- [Mock provider failure markers (`__fail_503` and others)](mock-provider/Program.cs)
 - [Golden Eval runner](evals/run.py) and [gate explanation](evals/README.md)
 - [Existing failure scenarios](docs/failure-scenarios.md)
 - [Compose configuration](docker-compose.yml) and [shifted ports](demo-ports.yml)
